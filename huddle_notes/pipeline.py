@@ -1,0 +1,276 @@
+"""One recording in, one document out: the call's notes and its transcript, with the
+speakers' names when naming is on (HUDDLE_SPEAKERS).
+
+Every step keeps its result in the recording's work folder, so a failed or repeated run
+picks up where it stopped instead of redoing the slow parts (whisper, video, Claude).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
+
+from huddle_notes.attribution import Attribution, Embedder, SpeakerAttributor
+from huddle_notes.domain import Crop, Detection, NamedBy, SpeakerGroup, Word
+from huddle_notes.feedback import Wishes
+from huddle_notes.media import Media, MediaError
+from huddle_notes.notes import NotesError, NotesWriter
+from huddle_notes.people import PeopleLibrary
+from huddle_notes.render import CallInfo, call_document, paragraphs, participants, report, transcript_markdown
+from huddle_notes.speakers.detector import SpeakerDetector
+from huddle_notes.transcribe import WhisperTranscriber, language_of, read_words
+
+log = logging.getLogger(__name__)
+
+UNKNOWN_FACES = "Не опознаны"
+UNSURE = 0.5  # a language heard with less probability is reported as a guess
+
+
+@dataclass(frozen=True)
+class CallResult:
+    document: Path
+    info: CallInfo
+    attribution: Attribution | None  # None when speakers are not named
+    report: str
+    notes: str | None = None
+    notes_error: str | None = None  # why there are no notes, when there are none
+    unknown_faces: list[Path] = field(default_factory=list)
+    recording: str = ""  # the recording's file name, so people know which call this is
+
+
+class CallProcessor:
+    def __init__(
+        self,
+        media: Media,
+        transcriber: WhisperTranscriber,
+        detector: SpeakerDetector,
+        attributor: SpeakerAttributor,
+        library: PeopleLibrary,
+        embedder_for: Callable[[Path], Embedder],
+        work_root: Path,
+        results_dir: Path,
+        notes: NotesWriter | None = None,
+        timezone: tzinfo = UTC,
+        wishes: Wishes | None = None,
+        speakers: bool = False,
+    ) -> None:
+        self.media = media
+        self.transcriber = transcriber
+        self.detector = detector
+        self.attributor = attributor
+        self.library = library
+        self.embedder_for = embedder_for
+        self.work_root = work_root
+        self.results_dir = results_dir
+        self.notes = notes
+        self.timezone = timezone
+        self.wishes = wishes  # read for every call: a wish written meanwhile counts from the next one
+        self.speakers = speakers  # off: no tiles, avatars or voices, a transcript without names
+
+    def process(self, video: Path, glossary: str, manual: dict[int, str], learn: bool = False) -> CallResult:
+        work = self.work_root / _safe_name(video.stem)
+        work.mkdir(parents=True, exist_ok=True)
+
+        audio = work / "audio.wav"
+        if not audio.exists():
+            log.info("%s: extracting audio", video.name)
+            self._atomic(audio, lambda tmp: self.media.extract_audio(video, tmp))
+
+        words_json = work / "words.json"
+        if not words_json.exists():
+            language = self._language(video, audio, work)
+            log.info("%s: transcribing", video.name)
+            done = self.transcriber.transcribe(audio, work / "partial-words", glossary, work / "whisper.log", language)
+            done.replace(words_json)
+
+        words = read_words(words_json)
+        log.info("%s: language %s, %d words", video.name, language_of(words_json), len(words))
+        detection, result = self._name_speakers(video, work, audio, words, manual) if self.speakers else (None, None)
+        if detection is not None and result is not None:
+            turns, duration, said = result.turns(), detection.frames / detection.fps, report(result, len(words))
+        else:
+            turns, duration = paragraphs(words), self._duration(video, words)
+            said = f"words {len(words)}; speakers not named (HUDDLE_SPEAKERS=off)"
+        info = CallInfo(self._started(video, duration), duration, participants(turns))
+        notes, notes_error = self._notes(work, transcript_markdown(turns), glossary)
+
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        document = self._document(work, info.file_name)
+        self._atomic(document, lambda tmp: _write_text(tmp, call_document(info, turns, notes)))
+        faces: list[Path] = []
+        if detection is not None and result is not None:
+            faces = self._save_unknown_faces(detection, result, self.results_dir / UNKNOWN_FACES / document.stem)
+            if learn:
+                self._learn(detection, result)
+        return CallResult(document, info, result, said, notes, notes_error, faces, video.name)
+
+    def _name_speakers(
+        self, video: Path, work: Path, audio: Path, words: list[Word], manual: dict[int, str]
+    ) -> tuple[Detection, Attribution]:
+        """Who said each word: the lit tiles on video, their avatars, the voices."""
+        speakers_json = work / "speakers.json"
+        if not speakers_json.exists():
+            log.info("%s: finding speakers on video", video.name)
+            found = self.detector.detect(video)
+            self._atomic(speakers_json, lambda tmp: _write_json(tmp, found.to_dict()))
+        detection = Detection.from_dict(json.loads(speakers_json.read_text(encoding="utf-8")))
+        result = self.attributor.attribute(
+            words,
+            detection.groups,
+            self.embedder_for(audio),
+            self.library.avatars,
+            self.library.voiceprints(),
+            manual,
+        )
+        return detection, result
+
+    def _language(self, video: Path, audio: Path, work: Path) -> str:
+        """The call's language: the one set, else the one whisper hears in the middle of the
+        call. Whisper alone listens to the first 30 seconds, often silence while people wait
+        for each other, and takes a Russian call for an English one. If the sample can't
+        tell, whisper guesses from the start after all."""
+        if self.transcriber.language != "auto":
+            return self.transcriber.language
+        sample = work / "language.wav"
+        try:
+            self.media.language_sample(audio, sample, self.media.duration(audio))
+            found = self.transcriber.detect_language(sample)
+        except (MediaError, ValueError) as e:
+            log.warning("%s: no language sample: %s", video.name, e)
+            found = None
+        finally:
+            with contextlib.suppress(OSError):  # Windows may still hold it: a stray file costs nothing
+                sample.unlink(missing_ok=True)
+        if found is None:
+            log.warning("%s: the language is left to whisper", video.name)
+            return "auto"
+        level = logging.INFO if found[1] >= UNSURE else logging.WARNING  # music or silence, say
+        log.log(level, "%s: language %s (p = %.2f), heard at 20, 50 and 80 %% of the call", video.name, *found)
+        return found[0]
+
+    def _duration(self, video: Path, words: list[Word]) -> float:
+        """The recording's length; the last word's end when the file can't say."""
+        try:
+            return self.media.duration(video)
+        except (MediaError, ValueError):
+            return words[-1].end if words else 0.0
+
+    def _document(self, work: Path, name: str) -> Path:
+        """The call's file in the results. A recording keeps the file it got the first time;
+        another recording that started in the same minute gets "<name> (2)", not its file."""
+        record = work / "document.txt"
+        if record.exists():
+            return self.results_dir / record.read_text(encoding="utf-8").strip()
+        stem, n = Path(name).stem, 1
+        while (self.results_dir / name).exists():
+            n += 1
+            name = f"{stem} ({n}).md"
+        self._atomic(record, lambda tmp: _write_text(tmp, name))
+        return self.results_dir / name
+
+    def _notes(self, work: Path, transcript: str, glossary: str) -> tuple[str | None, str | None]:
+        """Claude's notes, kept per request (model, instructions, glossary, wishes, transcript):
+        the same request never costs a second one.
+        A failure leaves the call without notes rather than without a result."""
+        if self.notes is None:
+            return None, None
+        wishes = self.wishes.for_prompt() if self.wishes else ""
+        given = f"{self.notes.model}\n{self.notes.prompt}\n{glossary}\n{wishes}\n{transcript}"
+        key = hashlib.sha256(given.encode()).hexdigest()[:16]
+        cached = work / f"notes-{key}.md"
+        if cached.exists():
+            return cached.read_text(encoding="utf-8"), None
+        log.info("writing notes with %s", self.notes.model)
+        try:
+            notes = self.notes.write(transcript, glossary, wishes)
+        except NotesError as e:
+            log.warning("no notes: %s", e)
+            return None, str(e)
+        self._atomic(cached, lambda tmp: _write_text(tmp, notes))
+        return notes, None
+
+    def _started(self, video: Path, duration: float) -> datetime:
+        """When the call started: from the recording's own metadata, else the file's time
+        (written when recording stopped) minus its length."""
+        try:
+            started = self.media.recorded_at(video)
+        except MediaError:
+            started = None
+        if started is None:
+            ended = datetime.fromtimestamp(video.stat().st_mtime, UTC)
+            started = ended - timedelta(seconds=duration)
+        return started.astimezone(self.timezone)
+
+    def _save_unknown_faces(self, detection: Detection, result: Attribution, folder: Path) -> list[Path]:
+        """Whom nobody could name, so a person can name them: the whole window with their
+        tile outlined, since a tile alone can't be told apart. Pictures from an earlier run
+        of this call go first: whoever was named since is no longer unknown."""
+        video = Path(detection.video)
+        for old in folder.glob("*.jpg"):
+            old.unlink(missing_ok=True)
+        saved = []
+        for g in result.groups:
+            name = result.names[g.id]
+            if name.by != NamedBy.UNKNOWN:
+                continue
+            folder.mkdir(parents=True, exist_ok=True)
+            face = _face_file(folder, name.name.rstrip("?"))
+            if self._save_face(self.media.save_marked, video, g, face):
+                saved.append(face)
+        if folder.is_dir() and not any(folder.iterdir()):
+            with contextlib.suppress(OSError):  # an empty folder left behind costs nothing
+                folder.rmdir()  # everyone is known now
+        return saved
+
+    def _learn(self, detection: Detection, result: Attribution) -> None:
+        video = Path(detection.video)
+        self.library.faces.mkdir(parents=True, exist_ok=True)
+        for g in result.groups:
+            name = result.names[g.id]
+            face = _face_file(self.library.faces, name.name)
+            if name.by in (NamedBy.MANUAL, NamedBy.AVATAR) and not face.exists():
+                self._save_face(self.media.save_crop, video, g, face)
+        self.library.learn(self.attributor.sightings(result))
+        self.library.save()
+
+    @staticmethod
+    def _save_face(save: Callable[[Path, float, Crop, Path], None], video: Path, g: SpeakerGroup, path: Path) -> bool:
+        try:
+            save(video, g.sample_t, g.crop, path)
+            return True
+        except MediaError as e:  # a missing face never costs the transcript
+            log.warning("no face for %s: %s", path.stem, e)
+            return False
+
+    @staticmethod
+    def _atomic(path: Path, make: Callable[[Path], None]) -> None:
+        """A step's file appears only when complete, so a crash is redone on the next run."""
+        tmp = path.with_name(f"partial-{path.name}")
+        make(tmp)
+        tmp.replace(path)
+
+
+def _write_json(path: Path, data: object) -> None:
+    _write_text(path, json.dumps(data, ensure_ascii=False))
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _safe_name(name: str) -> str:
+    """Typed or recorded names become file names, never paths."""
+    return re.sub(r"[^\w .-]", "_", name).strip(" ._") or "unnamed"
+
+
+def _face_file(folder: Path, name: str) -> Path:
+    """A person's picture: the name is typed by people, so it never becomes a path."""
+    safe = re.sub(r"[^\w -]", "_", name).strip(" _") or "unnamed"
+    return folder / f"{safe}.jpg"

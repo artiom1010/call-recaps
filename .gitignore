@@ -1,0 +1,32 @@
+# Call data never goes to git: recordings, transcripts, voices (biometric), glossaries, models
+data/
+regression/
+*.mov
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.m4a
+_work/
+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]-[0-9][0-9].md
+Не опознаны/
+*.onnx
+*.bin
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+.DS_Store
+deploy.log
