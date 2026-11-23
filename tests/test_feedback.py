@@ -241,6 +241,5 @@ def test_claude_gets_the_wishes_with_the_transcript(tmp_path):
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     ClaudeCodeNotes(str(script)).write("[00:00:01] **Петя:** привет", "Альфа", "- короче")
     assert seen.read_text(encoding="utf-8") == (
-        "Словарь команды: Альфа\n\nПожелания команды к заметкам:\n- короче\n\n"
-        "Расшифровка:\n[00:00:01] **Петя:** привет"
+        "Словарь команды: Альфа\n\nПожелания команды к заметкам:\n- короче\n\nРасшифровка:\n[00:00:01] **Петя:** привет"
     )
